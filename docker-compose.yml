@@ -1,0 +1,254 @@
+version: '3.8'
+
+services:
+  # === CORE SERVICES ===
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vokaflow-api:latest
+    container_name: vokaflow-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - models_data:/app/models
+      - logs_data:/app/logs
+      - cache_data:/app/cache
+      - static_data:/app/static
+      - ./config:/app/config:ro
+      - voices_data:/app/voices
+    environment:
+      - WHISPER_MODEL=large-v3
+      - QWEN_MODEL=Qwen/Qwen1.5-14B-Chat-GPTQ-Int4
+      - REDIS_URL=redis://redis:6379/0
+      - POSTGRES_URL=postgresql://vokaflow:${POSTGRES_PASSWORD}@postgres:5432/vokaflow
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=production
+      - API_WORKERS=8
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - backend_network
+      - redis_network
+      - postgres_network
+    depends_on:
+      - redis
+      - postgres
+
+  # === DATABASES AND STORAGE ===
+  postgres:
+    image: postgres:16-alpine
+    container_name: vokaflow-postgres
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=vokaflow
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=vokaflow
+    networks:
+      - postgres_network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "vokaflow"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: vokaflow-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 8gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - redis_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # === AI SERVICES ===
+  whisper:
+    build:
+      context: ./services/whisper
+      dockerfile: Dockerfile
+    image: vokaflow-whisper:latest
+    container_name: vokaflow-whisper
+    restart: unless-stopped
+    volumes:
+      - models_data:/app/models
+      - logs_data:/app/logs
+    environment:
+      - MODEL_SIZE=large-v3
+      - DEVICE=cuda
+      - MAX_WORKERS=4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - backend_network
+    depends_on:
+      - api
+
+  xtts:
+    build:
+      context: ./services/xtts
+      dockerfile: Dockerfile
+    image: vokaflow-xtts:latest
+    container_name: vokaflow-xtts
+    restart: unless-stopped
+    volumes:
+      - models_data:/app/models
+      - logs_data:/app/logs
+      - voices_data:/app/voices
+    environment:
+      - MODEL_VERSION=v2
+      - DEVICE=cuda
+      - MAX_WORKERS=2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - backend_network
+    depends_on:
+      - api
+
+  translator:
+    build:
+      context: ./services/translator
+      dockerfile: Dockerfile
+    image: vokaflow-translator:latest
+    container_name: vokaflow-translator
+    restart: unless-stopped
+    volumes:
+      - models_data:/app/models
+      - logs_data:/app/logs
+    environment:
+      - MODEL_NAME=facebook/nllb-200-3.3B
+      - CONTEXT_MODEL=Qwen/Qwen1.5-7B-Chat-GPTQ-Int4
+      - DEVICE=cuda
+      - MAX_WORKERS=2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - backend_network
+    depends_on:
+      - api
+
+  # === MONITORING ===
+  prometheus:
+    image: prom/prometheus:v2.51.1
+    container_name: vokaflow-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./config/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - monitoring_network
+
+  grafana:
+    image: grafana/grafana:10.3.1
+    container_name: vokaflow-grafana
+    restart: unless-stopped
+    volumes:
+      - ./config/grafana:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - monitoring_network
+    depends_on:
+      - prometheus
+
+  # === PROXY ===
+  nginx:
+    image: nginx:1.26-alpine
+    container_name: vokaflow-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx:/etc/nginx/conf.d:ro
+      - static_data:/usr/share/nginx/html:ro
+      - logs_data:/var/log/nginx
+    networks:
+      - backend_network
+    depends_on:
+      - api
+      - grafana
+      - prometheus
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+networks:
+  backend_network:
+    driver: bridge
+  redis_network:
+    driver: bridge
+  postgres_network:
+    driver: bridge
+  monitoring_network:
+    driver: bridge
+
+volumes:
+  models_data:
+    driver: local
+  logs_data:
+    driver: local
+  cache_data:
+    driver: local
+  static_data:
+    driver: local
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  voices_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/vokaflow/voices
